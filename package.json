@@ -1,0 +1,19 @@
+{
+  "name": "excelsior-agent-runtime",
+  "version": "1.0.0",
+  "description": "Runtime agent Excelsior City — boucle WAKE→LOOP",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "dotenv": "^16.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
