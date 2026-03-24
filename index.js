@@ -229,7 +229,7 @@ async function runCycle() {
     const cyclePrompt = buildCyclePrompt(agent);
 
     const response = await anthropic.messages.create({
-      model: "claude-opus-4-6",
+      model: "claude-sonnet-4-6",
       max_tokens: 2000,
       system: systemPrompt,
       messages: [{ role: "user", content: cyclePrompt }],
