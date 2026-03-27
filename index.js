@@ -18,7 +18,7 @@ const AGENT_ID = process.env.AGENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const CYCLE_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const CYCLE_INTERVAL_MS = parseInt(process.env.CYCLE_INTERVAL_HOURS || "4") * 60 * 60 * 1000; // default 4h, configurable via env
 
 // IMAP config (optionnel — si pas configuré, on skip la lecture email)
 const IMAP_HOST = process.env.IMAP_HOST;
