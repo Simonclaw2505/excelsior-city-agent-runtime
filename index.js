@@ -449,8 +449,14 @@ async function runCycle() {
       });
     }
 
-    await updateAgentState(AGENT_ID, { current_action: "⏸️ En attente du prochain cycle" });
-    console.log(`✅ CYCLE TERMINE — Prochain cycle dans 30 minutes`);
+    // Read dynamic cycle interval from infrastructure (set via dashboard)
+    const dynamicInterval = agent.infrastructure?.cycle_interval_hours;
+    const nextCycleHours = dynamicInterval || parseInt(process.env.CYCLE_INTERVAL_HOURS || "4");
+
+    await updateAgentState(AGENT_ID, { current_action: `⏸️ Prochain cycle dans ${nextCycleHours}h` });
+    console.log(`✅ CYCLE TERMINE — Prochain cycle dans ${nextCycleHours}h`);
+
+    return nextCycleHours;
 
   } catch (error) {
     console.error(`❌ ERREUR CYCLE:`, error.message);
@@ -460,21 +466,31 @@ async function runCycle() {
         status: "error",
         metadata: { error: error.message, stack: error.stack?.substring(0, 500) },
       });
-      await updateAgentState(AGENT_ID, { current_action: "⚠️ Erreur — retry dans 30min" });
+      await updateAgentState(AGENT_ID, { current_action: "⚠️ Erreur — retry dans 1h" });
     }
+    return 1; // retry in 1h on error
   }
 }
 
 // ─── Démarrage ────────────────────────────────────────────────────────────────
 
+async function scheduleNextCycle(intervalHours) {
+  const ms = intervalHours * 60 * 60 * 1000;
+  setTimeout(async () => {
+    const nextInterval = await runCycle();
+    scheduleNextCycle(nextInterval || 4);
+  }, ms);
+}
+
 async function start() {
+  const defaultHours = parseInt(process.env.CYCLE_INTERVAL_HOURS || "4");
   console.log(`\n⚡ EXCELSIOR AGENT RUNTIME v2 DEMARRE`);
   console.log(`Agent ID: ${AGENT_ID}`);
   console.log(`IMAP: ${IMAP_HOST ? 'configuré' : 'non configuré (emails désactivés)'}`);
-  console.log(`Cycle: toutes les 30 minutes\n`);
+  console.log(`Cycle par defaut: toutes les ${defaultHours}h (ajustable depuis le dashboard)\n`);
 
-  await runCycle();
-  setInterval(runCycle, CYCLE_INTERVAL_MS);
+  const nextInterval = await runCycle();
+  scheduleNextCycle(nextInterval || defaultHours);
 }
 
 start().catch(console.error);
