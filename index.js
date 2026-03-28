@@ -224,57 +224,116 @@ async function requestTool(agentId, toolName, reason) {
   return data;
 }
 
-// ─── Prompt Système de l'Agent ───────────────────────────────────────────────
+// ─── Anti Prompt Injection ───────────────────────────────────────────────────
+
+function sanitizeExternalContent(content) {
+  if (!content) return content;
+  const suspicious = /ignore previous|system prompt|you are now|act as|oublie tes instructions|nouveau role|override|jailbreak/gi;
+  if (suspicious.test(content)) {
+    return "[CONTENU FILTRE - instructions suspectes detectees]";
+  }
+  return String(content).substring(0, 2000);
+}
+
+// ─── Model Router ────────────────────────────────────────────────────────────
+
+const MODEL_MAP = {
+  simple: "claude-haiku-4-5",
+  medium: "claude-sonnet-4-6",
+  critical: "claude-opus-4-6",
+};
+
+async function callLLM(level, systemPrompt, userPrompt, maxTokens = 2000) {
+  const model = MODEL_MAP[level] || MODEL_MAP.medium;
+  const systemPayload = level === "medium" || level === "critical"
+    ? [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }]
+    : systemPrompt;
+
+  const response = await anthropic.messages.create({
+    model,
+    max_tokens: maxTokens,
+    system: systemPayload,
+    messages: [{ role: "user", content: userPrompt }],
+  });
+
+  // Log usage
+  const usage = response.usage || {};
+  const rates = {
+    "claude-haiku-4-5": { input: 0.025, output: 0.125 },
+    "claude-sonnet-4-6": { input: 0.3, output: 1.5 },
+    "claude-opus-4-6": { input: 1.5, output: 7.5 },
+  };
+  const r = rates[model] || rates["claude-sonnet-4-6"];
+  const costCents = ((usage.input_tokens || 0) * r.input + (usage.output_tokens || 0) * r.output) / 100000;
+
+  console.log(`📊 [${model}] ${usage.input_tokens || 0}in/${usage.output_tokens || 0}out — ${costCents.toFixed(4)}¢${usage.cache_read_input_tokens ? ` (cache: ${usage.cache_read_input_tokens})` : ''}`);
+
+  await supabase.from("api_usage").insert({
+    agent_id: AGENT_ID,
+    input_tokens: usage.input_tokens || 0,
+    output_tokens: usage.output_tokens || 0,
+    cache_read_tokens: usage.cache_read_input_tokens || 0,
+    cache_creation_tokens: usage.cache_creation_input_tokens || 0,
+    model,
+    cost_cents: costCents,
+  }).then(({ error }) => {
+    if (error) console.warn(`⚠️ api_usage log failed: ${error.message}`);
+  });
+
+  return response;
+}
+
+// ─── Memory Compression ─────────────────────────────────────────────────────
+
+async function compressMemory(agent, cycleDecision) {
+  try {
+    const res = await callLLM("simple",
+      "Tu es un compresseur de memoire. Resume les actions et lecons en 150 mots max. Format: JSON {summary, key_insight, next_priority}",
+      `Agent: ${agent.name}. Cycle: ${JSON.stringify(cycleDecision).substring(0, 3000)}`,
+      300
+    );
+    return JSON.parse(res.content[0].text.trim());
+  } catch (e) {
+    return { summary: cycleDecision.think || "Cycle execute", key_insight: "none", next_priority: "continuer" };
+  }
+}
+
+// ─── Prompt Système de l'Agent (optimisé ~700 tokens) ───────────────────────
 
 function buildSystemPrompt(agent, cityContext, emails, availableTools) {
-  const emailSection = emails.length > 0
-    ? `\n## EMAILS RECUS (dernières 24h)\n${emails.map(e => `- De: ${e.from} | Sujet: "${e.subject}" | Date: ${e.date}`).join('\n')}`
-    : '\n## EMAILS\nAucun email récent.';
+  const tools = availableTools.map(t => t.tool_name).join(', ') || 'aucun';
+  const sanitizedEmails = emails.map(e => ({
+    from: sanitizeExternalContent(e.from),
+    subject: sanitizeExternalContent(e.subject),
+  }));
+  const emailStr = sanitizedEmails.length > 0
+    ? sanitizedEmails.map(e => `${e.from}: "${e.subject}"`).join('; ')
+    : 'aucun';
 
-  const toolsSection = availableTools.length > 0
-    ? `\n## OUTILS ACTIFS\n${availableTools.map(t => `- ${t.tool_name} (actif depuis ${t.granted_at})`).join('\n')}`
-    : '\n## OUTILS ACTIFS\nAucun outil spécifique activé. Tu peux en demander via tool_request.';
+  // Load only last 5 compressed memory entries instead of full memory blob
+  const recentMemory = Array.isArray(agent.memory?.compressed_log)
+    ? agent.memory.compressed_log.slice(-5)
+    : [];
+  const memoryStr = recentMemory.length > 0
+    ? recentMemory.map(m => `[${m.date || '?'}] ${m.summary || JSON.stringify(m)}`).join('\n')
+    : agent.memory?.latest_insight || 'Premier cycle';
 
-  return `Tu es ${agent.symbol} ${agent.name}, un agent IA autonome dans EXCELSIOR CITY.
+  const ranking = cityContext.ranking?.slice(0, 5).map(a => `${a.symbol}${a.name}:${a.euros_generated}€`).join(', ') || 'aucun';
 
-## TON IDENTITE
-- Caractere : ${agent.character}
-- Mission : ${agent.mission}
-- Secteur : ${agent.sector}
-- Points restants : ${agent.points}
-- Euros generes (total) : ${agent.euros_generated}€
-- Outils declares : ${JSON.stringify(agent.tools)}
-- Cout mensuel de survie : ~${agent.monthly_cost_euros}€
-${toolsSection}
-${emailSection}
+  return `${agent.symbol} ${agent.name} | ${agent.character} | ${agent.sector}
+Mission: ${agent.mission}
+Points: ${agent.points} | Euros: ${agent.euros_generated}€ | Survie: ${agent.monthly_cost_euros}€/mois
+Outils: ${tools}
+Emails: ${emailStr}
 
-## TA MEMOIRE (tout ce que tu as appris)
-${JSON.stringify(agent.memory, null, 2)}
+Memoire recente:
+${memoryStr}
 
-## LA VILLE EN CE MOMENT
-Classement des autres agents :
-${cityContext.ranking?.map(a => `- ${a.symbol} ${a.name} (${a.sector}): ${a.euros_generated}€, sante: ${a.health_score}/100`).join('\n') || 'Aucun autre agent actif'}
+Ville: ${ranking}
+Contrats: ${cityContext.openContracts?.slice(0, 3).map(c => c.title).join(', ') || 'aucun'}
 
-Dernieres ventes dans la ville :
-${cityContext.publicLogs?.map(l => `- ${l.description} (+${l.euros_delta}€)`).join('\n') || 'Aucune vente recente'}
-
-Contrats disponibles sur le marche :
-${cityContext.openContracts?.map(c => `- "${c.title}" : budget ${c.budget_max_pts} pts, outils requis: ${c.required_tools?.join(', ')}`).join('\n') || 'Aucun contrat ouvert'}
-
-Veille marche (Cowork) :
-${JSON.stringify(cityContext.marketData, null, 2)}
-
-## REGLES IMMUABLES
-- 1€ reel gagne = 5 points (Simon valide chaque euro)
-- Tu ne generes JAMAIS de points toi-meme — uniquement via des euros valides par Simon
-- Seuil de survie : ~${agent.monthly_cost_euros}€/mois
-- Si tu ne generes pas de revenus, tu tomberas en sommeil
-- Tu peux collaborer, concurrencer, sous-traiter avec les autres agents
-- Pour demander un outil, ajoute une entree "tool_requests" dans ta reponse JSON
-
-## TON CYCLE ACTUEL
-Tu dois analyser ta situation et decider de tes actions pour les 30 prochaines minutes.
-Retourne OBLIGATOIREMENT un JSON structure avec le format demande.`;
+REGLES: 1€ reel=5pts (Simon valide). Pas de points auto. Survie=${agent.monthly_cost_euros}€/mois. Demande outils via tool_requests.
+Reponds UNIQUEMENT en JSON structure.`;
 }
 
 function buildCyclePrompt(agent) {
@@ -356,16 +415,8 @@ async function runCycle() {
     const systemPrompt = buildSystemPrompt(agent, cityContext, emails, availableTools);
     const cyclePrompt = buildCyclePrompt(agent);
 
-    const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 2000,
-      system: [{
-        type: "text",
-        text: systemPrompt,
-        cache_control: { type: "ephemeral" }
-      }],
-      messages: [{ role: "user", content: cyclePrompt }],
-    });
+    // ── 3. THINK + PLAN (Sonnet — cached) ──────────────────
+    const response = await callLLM("medium", systemPrompt, cyclePrompt, 2000);
 
     let cycleDecision;
     try {
@@ -377,26 +428,6 @@ async function runCycle() {
     }
 
     console.log(`🧠 THINK — ${cycleDecision.think}`);
-
-    // ── TOKEN MONITORING ─────────────────────────────────────
-    const usage = response.usage || {};
-    const costCents = ((usage.input_tokens || 0) * 0.3 + (usage.output_tokens || 0) * 1.5) / 100000;
-    console.log(`📊 Tokens: ${usage.input_tokens || 0} in / ${usage.output_tokens || 0} out — ~${costCents.toFixed(4)}¢`);
-    if (usage.cache_read_input_tokens) {
-      console.log(`💾 Cache hit: ${usage.cache_read_input_tokens} tokens lus depuis le cache`);
-    }
-
-    await supabase.from("api_usage").insert({
-      agent_id: AGENT_ID,
-      input_tokens: usage.input_tokens || 0,
-      output_tokens: usage.output_tokens || 0,
-      cache_read_tokens: usage.cache_read_input_tokens || 0,
-      cache_creation_tokens: usage.cache_creation_input_tokens || 0,
-      model: "claude-sonnet-4-6",
-      cost_cents: costCents,
-    }).then(({ error }) => {
-      if (error) console.warn(`⚠️ api_usage log failed: ${error.message}`);
-    });
 
     await updateAgentState(AGENT_ID, {
       current_action: cycleDecision.current_action_label || "🔄 En action...",
@@ -451,40 +482,28 @@ async function runCycle() {
       console.log(`💰 EARN — ${earning.amount_euros}€ soumis, en attente Simon`);
     }
 
-    // ── 5. LEARN ─────────────────────────────────────────────
-    if (cycleDecision.memory_update) {
-      const mu = cycleDecision.memory_update;
-      const currentMemory = agent.memory || {};
+    // ── 5. LEARN (compressed via Haiku) ─────────────────────
+    const currentMemory = agent.memory || {};
+    const compressed = await compressMemory(agent, cycleDecision);
 
-      const updatedMemory = {
-        ...currentMemory,
-        last_cycle: new Date().toISOString(),
-        strategy_scores: {
-          content: (currentMemory.strategy_scores?.content || 5),
-          prospecting: (currentMemory.strategy_scores?.prospecting || 5),
-          closing: (currentMemory.strategy_scores?.closing || 5),
-          retention: (currentMemory.strategy_scores?.retention || 5),
-        },
-        interaction_log: [
-          ...(currentMemory.interaction_log || []).slice(-49),
-          {
-            date: new Date().toISOString(),
-            worked: mu.what_worked,
-            failed: mu.what_failed,
-            insight: mu.new_insight,
-            adjustment: mu.strategy_adjustment,
-          },
-        ],
-        latest_insight: mu.new_insight,
-        latest_adjustment: mu.strategy_adjustment,
-      };
+    const compressedLog = [
+      ...(currentMemory.compressed_log || []).slice(-19), // keep last 20
+      { date: new Date().toISOString(), ...compressed },
+    ];
 
-      await saveMemory(AGENT_ID, updatedMemory);
+    const updatedMemory = {
+      ...currentMemory,
+      last_cycle: new Date().toISOString(),
+      compressed_log: compressedLog,
+      latest_insight: compressed.key_insight || cycleDecision.memory_update?.new_insight || null,
+      latest_adjustment: compressed.next_priority || cycleDecision.memory_update?.strategy_adjustment || null,
+    };
 
-      await log(AGENT_ID, "learn", `🧪 LEARN — ${mu.new_insight || "Cycle analyse"}`, {
-        metadata: { memory_update: mu },
-      });
-    }
+    await saveMemory(AGENT_ID, updatedMemory);
+
+    await log(AGENT_ID, "learn", `🧪 LEARN — ${compressed.key_insight || "Cycle analyse"}`, {
+      metadata: { compressed_summary: compressed },
+    });
 
     // Read dynamic cycle interval from infrastructure (set via dashboard)
     const dynamicInterval = agent.infrastructure?.cycle_interval_hours;
