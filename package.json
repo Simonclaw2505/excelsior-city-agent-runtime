@@ -12,7 +12,9 @@
     "@anthropic-ai/sdk": "^0.39.0",
     "@supabase/supabase-js": "^2.49.0",
     "dotenv": "^16.4.0",
-    "imapflow": "^1.0.160"
+    "imapflow": "^1.0.160",
+    "puppeteer": "^22.0.0",
+    "nodemailer": "^6.9.0"
   },
   "engines": {
     "node": ">=18.0.0"

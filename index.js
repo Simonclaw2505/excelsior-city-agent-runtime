@@ -9,6 +9,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { ImapFlow } from "imapflow";
 import dotenv from "dotenv";
+import { executeTool, closeBrowser } from "./tools.js";
 
 dotenv.config();
 
@@ -358,7 +359,11 @@ async function runCycle() {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 2000,
-      system: systemPrompt,
+      system: [{
+        type: "text",
+        text: systemPrompt,
+        cache_control: { type: "ephemeral" }
+      }],
       messages: [{ role: "user", content: cyclePrompt }],
     });
 
@@ -373,15 +378,47 @@ async function runCycle() {
 
     console.log(`🧠 THINK — ${cycleDecision.think}`);
 
+    // ── TOKEN MONITORING ─────────────────────────────────────
+    const usage = response.usage || {};
+    const costCents = ((usage.input_tokens || 0) * 0.3 + (usage.output_tokens || 0) * 1.5) / 100000;
+    console.log(`📊 Tokens: ${usage.input_tokens || 0} in / ${usage.output_tokens || 0} out — ~${costCents.toFixed(4)}¢`);
+    if (usage.cache_read_input_tokens) {
+      console.log(`💾 Cache hit: ${usage.cache_read_input_tokens} tokens lus depuis le cache`);
+    }
+
+    await supabase.from("api_usage").insert({
+      agent_id: AGENT_ID,
+      input_tokens: usage.input_tokens || 0,
+      output_tokens: usage.output_tokens || 0,
+      cache_read_tokens: usage.cache_read_input_tokens || 0,
+      cache_creation_tokens: usage.cache_creation_input_tokens || 0,
+      model: "claude-sonnet-4-6",
+      cost_cents: costCents,
+    }).then(({ error }) => {
+      if (error) console.warn(`⚠️ api_usage log failed: ${error.message}`);
+    });
+
     await updateAgentState(AGENT_ID, {
       current_action: cycleDecision.current_action_label || "🔄 En action...",
     });
 
-    // Logger les actions planifiées
+    // ── EXECUTE ACTIONS (réellement) ─────────────────────────
     for (const action of cycleDecision.actions || []) {
+      console.log(`🔧 EXEC — ${action.tool}: ${action.description}`);
+
+      let result = null;
+      try {
+        result = await executeTool(action, agent);
+        console.log(`   → ${result.success ? '✅' : '❌'} ${result.error || 'OK'}`);
+      } catch (e) {
+        result = { success: false, error: e.message };
+        console.error(`   → ❌ ${e.message}`);
+      }
+
       await log(AGENT_ID, action.type || "research", `${action.description} → ${action.expected_outcome}`, {
         tool_used: action.tool,
-        metadata: { target: action.target },
+        status: result?.success ? "ok" : "error",
+        metadata: { target: action.target, execution_result: result },
       });
     }
 
@@ -452,6 +489,9 @@ async function runCycle() {
     // Read dynamic cycle interval from infrastructure (set via dashboard)
     const dynamicInterval = agent.infrastructure?.cycle_interval_hours;
     const nextCycleHours = dynamicInterval || parseInt(process.env.CYCLE_INTERVAL_HOURS || "4");
+
+    // Fermer le browser si ouvert
+    await closeBrowser();
 
     await updateAgentState(AGENT_ID, { current_action: `⏸️ Prochain cycle dans ${nextCycleHours}h` });
     console.log(`✅ CYCLE TERMINE — Prochain cycle dans ${nextCycleHours}h`);
