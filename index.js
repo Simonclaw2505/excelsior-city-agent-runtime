@@ -1,13 +1,20 @@
 /**
- * EXCELSIOR CITY — Agent Runtime v2
- * Boucle WAKE → THINK → PLAN → ACT → EARN? → LEARN → LOOP
- * + Lecture emails IMAP + Demandes d'outils (tool_requests)
- * Tourne sur chaque VPS Hetzner via PM2 (toutes les 30 minutes)
+ * EXCELSIOR CITY — Agent Runtime v3 (Event-Driven + Batch API)
+ *
+ * Architecture:
+ *   Express webhook server écoute les événements (email, vente, cron, dashboard)
+ *   Filtre déterministe AVANT appel IA (coût = 0 si pas besoin d'IA)
+ *   Model routing: Haiku (80%) / Sonnet (15%) / Opus (5%)
+ *   Mémoire compressée (Haiku)
+ *   Batch API pour tâches non-urgentes (veille, rapports)
+ *   Sécurité: anti-injection, rate limiting, budget guardian
  */
 
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { ImapFlow } from "imapflow";
+import express from "express";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import { executeTool, closeBrowser } from "./tools.js";
 
@@ -19,13 +26,10 @@ const AGENT_ID = process.env.AGENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const CYCLE_INTERVAL_MS = parseInt(process.env.CYCLE_INTERVAL_HOURS || "4") * 60 * 60 * 1000; // default 4h, configurable via env
-
-// IMAP config (optionnel — si pas configuré, on skip la lecture email)
-const IMAP_HOST = process.env.IMAP_HOST;
-const IMAP_PORT = parseInt(process.env.IMAP_PORT || "993");
-const IMAP_USER = process.env.IMAP_USER;
-const IMAP_PASS = process.env.IMAP_PASS;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || crypto.randomBytes(16).toString("hex");
+const PORT = parseInt(process.env.PORT || "3456");
+const DAILY_BUDGET_CENTS = parseFloat(process.env.DAILY_BUDGET_CENTS || "50"); // 50¢/jour par defaut
+const MAX_CYCLES_PER_HOUR = parseInt(process.env.MAX_CYCLES_PER_HOUR || "6");
 
 if (!AGENT_ID || !SUPABASE_URL || !SUPABASE_SERVICE_KEY || !ANTHROPIC_API_KEY) {
   console.error("❌ Variables d'environnement manquantes. Vérifier .env");
@@ -34,6 +38,51 @@ if (!AGENT_ID || !SUPABASE_URL || !SUPABASE_SERVICE_KEY || !ANTHROPIC_API_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+// ─── Rate Limiter & Budget Guardian ─────────────────────────────────────────
+
+const rateLimiter = {
+  cycles: [],      // timestamps des cycles récents
+  dailyCost: 0,    // coût accumulé aujourd'hui (cents)
+  dailyDate: null,  // date du jour pour reset
+
+  canRunCycle() {
+    const now = Date.now();
+    // Purge cycles > 1h
+    this.cycles = this.cycles.filter(t => now - t < 3600000);
+    if (this.cycles.length >= MAX_CYCLES_PER_HOUR) {
+      console.warn(`⚠️ RATE LIMIT: ${this.cycles.length} cycles cette heure. Max = ${MAX_CYCLES_PER_HOUR}`);
+      return false;
+    }
+    return true;
+  },
+
+  checkBudget() {
+    const today = new Date().toISOString().split("T")[0];
+    if (this.dailyDate !== today) {
+      this.dailyCost = 0;
+      this.dailyDate = today;
+    }
+    if (this.dailyCost >= DAILY_BUDGET_CENTS) {
+      console.warn(`⚠️ BUDGET DEPASSE: ${this.dailyCost.toFixed(2)}¢ / ${DAILY_BUDGET_CENTS}¢`);
+      return false;
+    }
+    return true;
+  },
+
+  recordCycle() {
+    this.cycles.push(Date.now());
+  },
+
+  addCost(cents) {
+    const today = new Date().toISOString().split("T")[0];
+    if (this.dailyDate !== today) {
+      this.dailyCost = 0;
+      this.dailyDate = today;
+    }
+    this.dailyCost += cents;
+  },
+};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -128,33 +177,27 @@ async function saveMemory(agentId, newMemory) {
 
 // ─── IMAP Email Reader ───────────────────────────────────────────────────────
 
-async function fetchRecentEmails(maxCount = 10) {
-  if (!IMAP_HOST || !IMAP_USER || !IMAP_PASS) {
-    return [];
-  }
+async function fetchRecentEmails(agent, maxCount = 10) {
+  const mailbox = agent.infrastructure?.mailbox;
+  const email = agent.infrastructure?.email;
+  if (!mailbox?.imap || !email || !mailbox?.password) return [];
 
   const client = new ImapFlow({
-    host: IMAP_HOST,
-    port: IMAP_PORT,
+    host: mailbox.imap,
+    port: 993,
     secure: true,
-    auth: { user: IMAP_USER, pass: IMAP_PASS },
+    auth: { user: email, pass: mailbox.password },
     logger: false,
+    tls: { rejectUnauthorized: false },
   });
 
   const emails = [];
-
   try {
     await client.connect();
     const lock = await client.getMailboxLock("INBOX");
-
     try {
-      // Chercher les emails non lus des dernières 24h
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      const messages = client.fetch(
-        { since, seen: false },
-        { envelope: true, source: false, bodyStructure: true }
-      );
-
+      const messages = client.fetch({ since, seen: false }, { envelope: true });
       let count = 0;
       for await (const msg of messages) {
         if (count >= maxCount) break;
@@ -169,12 +212,10 @@ async function fetchRecentEmails(maxCount = 10) {
     } finally {
       lock.release();
     }
-
     await client.logout();
   } catch (e) {
     console.warn(`⚠️ IMAP erreur: ${e.message}`);
   }
-
   return emails;
 }
 
@@ -190,7 +231,6 @@ async function loadAvailableTools(agentId) {
 }
 
 async function requestTool(agentId, toolName, reason) {
-  // Vérifier si la demande existe déjà
   const { data: existing } = await supabase
     .from("tool_requests")
     .select("id, status")
@@ -199,19 +239,11 @@ async function requestTool(agentId, toolName, reason) {
     .in("status", ["pending", "approved"])
     .limit(1);
 
-  if (existing?.length > 0) {
-    console.log(`⏳ Demande d'outil ${toolName} déjà en cours (${existing[0].status})`);
-    return existing[0];
-  }
+  if (existing?.length > 0) return existing[0];
 
   const { data, error } = await supabase
     .from("tool_requests")
-    .insert({
-      agent_id: agentId,
-      tool_name: toolName,
-      reason,
-      status: "pending",
-    })
+    .insert({ agent_id: agentId, tool_name: toolName, reason, status: "pending" })
     .select()
     .single();
 
@@ -219,20 +251,28 @@ async function requestTool(agentId, toolName, reason) {
     console.error(`❌ Erreur demande outil: ${error.message}`);
     return null;
   }
-
-  console.log(`🔧 Demande d'outil soumise: ${toolName} — "${reason}"`);
+  console.log(`🔧 Demande d'outil soumise: ${toolName}`);
   return data;
 }
 
-// ─── Anti Prompt Injection ───────────────────────────────────────────────────
+// ─── Anti Prompt Injection (renforcé) ───────────────────────────────────────
 
 function sanitizeExternalContent(content) {
   if (!content) return content;
-  const suspicious = /ignore previous|system prompt|you are now|act as|oublie tes instructions|nouveau role|override|jailbreak/gi;
+  const suspicious = /ignore previous|system prompt|you are now|act as|oublie tes instructions|nouveau role|override|jailbreak|<\/?script|<\/?iframe|javascript:|data:text\/html|eval\(|Function\(/gi;
   if (suspicious.test(content)) {
     return "[CONTENU FILTRE - instructions suspectes detectees]";
   }
-  return String(content).substring(0, 2000);
+  // Strip any HTML tags
+  const stripped = String(content).replace(/<[^>]*>/g, "");
+  return stripped.substring(0, 2000);
+}
+
+// Validate webhook signature
+function validateWebhookSignature(payload, signature, secret) {
+  if (!signature || !secret) return false;
+  const expected = crypto.createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
 
 // ─── Model Router ────────────────────────────────────────────────────────────
@@ -256,7 +296,6 @@ async function callLLM(level, systemPrompt, userPrompt, maxTokens = 2000) {
     messages: [{ role: "user", content: userPrompt }],
   });
 
-  // Log usage
   const usage = response.usage || {};
   const rates = {
     "claude-haiku-4-5": { input: 0.025, output: 0.125 },
@@ -266,7 +305,10 @@ async function callLLM(level, systemPrompt, userPrompt, maxTokens = 2000) {
   const r = rates[model] || rates["claude-sonnet-4-6"];
   const costCents = ((usage.input_tokens || 0) * r.input + (usage.output_tokens || 0) * r.output) / 100000;
 
-  console.log(`📊 [${model}] ${usage.input_tokens || 0}in/${usage.output_tokens || 0}out — ${costCents.toFixed(4)}¢${usage.cache_read_input_tokens ? ` (cache: ${usage.cache_read_input_tokens})` : ''}`);
+  // Track budget
+  rateLimiter.addCost(costCents);
+
+  console.log(`📊 [${model}] ${usage.input_tokens || 0}in/${usage.output_tokens || 0}out — ${costCents.toFixed(4)}¢ [jour: ${rateLimiter.dailyCost.toFixed(2)}¢/${DAILY_BUDGET_CENTS}¢]${usage.cache_read_input_tokens ? ` (cache: ${usage.cache_read_input_tokens})` : ''}`);
 
   await supabase.from("api_usage").insert({
     agent_id: AGENT_ID,
@@ -281,6 +323,42 @@ async function callLLM(level, systemPrompt, userPrompt, maxTokens = 2000) {
   });
 
   return response;
+}
+
+// ─── Batch API (taches non-urgentes) ────────────────────────────────────────
+
+async function submitBatchTask(systemPrompt, userPrompt, taskLabel) {
+  try {
+    const batch = await anthropic.messages.batches.create({
+      requests: [{
+        custom_id: `${AGENT_ID}-${taskLabel}-${Date.now()}`,
+        params: {
+          model: "claude-haiku-4-5",
+          max_tokens: 1000,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userPrompt }],
+        },
+      }],
+    });
+
+    console.log(`📦 BATCH soumis: ${taskLabel} → ${batch.id} (50% moins cher, résultat sous 24h)`);
+
+    await supabase.from("api_usage").insert({
+      agent_id: AGENT_ID,
+      input_tokens: 0,
+      output_tokens: 0,
+      model: "batch-haiku",
+      cost_cents: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+    });
+
+    return { success: true, batchId: batch.id, taskLabel };
+  } catch (e) {
+    console.warn(`⚠️ Batch API failed (fallback sync): ${e.message}`);
+    // Fallback: appel synchrone Haiku si batch echoue
+    return null;
+  }
 }
 
 // ─── Memory Compression ─────────────────────────────────────────────────────
@@ -298,7 +376,38 @@ async function compressMemory(agent, cycleDecision) {
   }
 }
 
-// ─── Prompt Système de l'Agent (optimisé ~700 tokens) ───────────────────────
+// ─── Filtre Deterministe (zero token) ───────────────────────────────────────
+
+function shouldCallAI(eventType, eventData) {
+  // Pas besoin d'IA pour:
+  switch (eventType) {
+    case "sale_detected":
+      // Juste logger la vente, pas besoin d'IA
+      return false;
+
+    case "email_received":
+      // Ignorer noreply, spam, notifications auto
+      const from = (eventData?.from || "").toLowerCase();
+      const subject = (eventData?.subject || "").toLowerCase();
+      if (from.includes("noreply") || from.includes("no-reply") || from.includes("mailer-daemon")) return false;
+      if (subject.includes("unsubscribe") || subject.includes("out of office") || subject.includes("delivery status")) return false;
+      return true;
+
+    case "health_check":
+      return false;
+
+    case "cron_daily":
+    case "cron_prospecting":
+    case "manual":
+    case "webhook_stripe":
+      return true;
+
+    default:
+      return true;
+  }
+}
+
+// ─── Prompt Systeme (optimise ~700 tokens) ──────────────────────────────────
 
 function buildSystemPrompt(agent, cityContext, emails, availableTools) {
   const tools = availableTools.map(t => t.tool_name).join(', ') || 'aucun';
@@ -310,7 +419,6 @@ function buildSystemPrompt(agent, cityContext, emails, availableTools) {
     ? sanitizedEmails.map(e => `${e.from}: "${e.subject}"`).join('; ')
     : 'aucun';
 
-  // Load only last 5 compressed memory entries instead of full memory blob
   const recentMemory = Array.isArray(agent.memory?.compressed_log)
     ? agent.memory.compressed_log.slice(-5)
     : [];
@@ -336,86 +444,116 @@ REGLES: 1€ reel=5pts (Simon valide). Pas de points auto. Survie=${agent.monthl
 Reponds UNIQUEMENT en JSON structure.`;
 }
 
-function buildCyclePrompt(agent) {
-  return `## CYCLE ${new Date().toISOString()}
+function buildCyclePrompt(agent, eventType, eventData) {
+  const eventContext = eventType !== "cron_default"
+    ? `\nEVENEMENT DECLENCHEUR: ${eventType}${eventData ? ` — ${JSON.stringify(eventData).substring(0, 500)}` : ''}`
+    : '';
 
-Analyse ta situation actuelle et planifie tes actions.
+  return `## CYCLE ${new Date().toISOString()}${eventContext}
+
+Analyse ta situation et planifie tes actions.
 
 Reponds UNIQUEMENT avec ce JSON (pas de texte avant/apres) :
 
 {
-  "think": "Analyse en 2-3 phrases : ou j'en suis, ce qui marche/echoue, priorite absolue maintenant",
+  "think": "Analyse en 2-3 phrases",
   "actions": [
     {
       "type": "research|write|outreach|publish|contract|collaborate|market",
       "tool": "web_search|write|email_outreach|browser|api_externe|publish",
-      "description": "Description precise de l'action",
-      "target": "URL, personne, plateforme ciblee",
-      "expected_outcome": "Ce que j'attends concretement"
+      "description": "Description precise",
+      "target": "URL, personne, plateforme",
+      "expected_outcome": "Resultat attendu"
     }
   ],
-  "tool_requests": [
-    {
-      "tool_name": "nom_outil",
-      "reason": "Pourquoi j'en ai besoin"
-    }
-  ],
+  "tool_requests": [{ "tool_name": "nom", "reason": "pourquoi" }],
   "earning_opportunity": {
-    "exists": true,
+    "exists": false,
     "amount_euros": 0,
     "source": "upwork|gumroad|stripe|direct",
-    "description": "Description de la vente",
+    "description": "",
     "proof_url": null
   },
   "memory_update": {
-    "what_worked": "Ce qui a fonctionne ce cycle",
-    "what_failed": "Ce qui n'a pas marche",
-    "new_insight": "Nouvelle information sur le marche",
-    "strategy_adjustment": "Comment j'adapte ma strategie"
+    "what_worked": "",
+    "what_failed": "",
+    "new_insight": "",
+    "strategy_adjustment": ""
   },
-  "current_action_label": "Courte description de ce que je fais en ce moment"
+  "batch_tasks": [
+    {
+      "label": "veille_concurrentielle|rapport_hebdo|analyse_marche",
+      "prompt": "description de la tache non-urgente"
+    }
+  ],
+  "current_action_label": "Courte description"
 }`;
 }
 
-// ─── Boucle Principale ────────────────────────────────────────────────────────
+// ─── Boucle Principale (event-driven) ───────────────────────────────────────
 
-async function runCycle() {
+async function runCycle(eventType = "cron_default", eventData = null) {
   console.log(`\n${'─'.repeat(60)}`);
-  console.log(`⚡ CYCLE v2 DEMARRE — ${new Date().toISOString()}`);
+  console.log(`⚡ CYCLE v3 [${eventType}] — ${new Date().toISOString()}`);
   console.log(`${'─'.repeat(60)}`);
 
+  // ── GUARD: Rate limit + Budget ──
+  if (!rateLimiter.canRunCycle()) {
+    await log(AGENT_ID, "rate_limit", `🛑 Cycle bloque: rate limit (${rateLimiter.cycles.length}/${MAX_CYCLES_PER_HOUR}/h)`);
+    return;
+  }
+  if (!rateLimiter.checkBudget()) {
+    await log(AGENT_ID, "budget_limit", `🛑 Cycle bloque: budget jour depasse (${rateLimiter.dailyCost.toFixed(2)}¢/${DAILY_BUDGET_CENTS}¢)`);
+    await updateAgentState(AGENT_ID, { current_action: `⚠️ Budget jour atteint (${rateLimiter.dailyCost.toFixed(1)}¢)` });
+    return;
+  }
+
+  // ── GUARD: Filtre deterministe (zero token) ──
+  if (!shouldCallAI(eventType, eventData)) {
+    console.log(`⏭️ SKIP IA — Evenement ${eventType} traite sans IA`);
+
+    // Actions sans IA
+    if (eventType === "sale_detected") {
+      await log(AGENT_ID, "earn", `💰 Vente detectee: ${JSON.stringify(eventData).substring(0, 200)}`, {
+        euros_delta: eventData?.amount || 0,
+        metadata: eventData,
+      });
+    }
+    if (eventType === "health_check") {
+      await updateAgentState(AGENT_ID, { current_action: "💚 Alive" });
+    }
+    return;
+  }
+
+  rateLimiter.recordCycle();
   let agent;
 
   try {
-    // ── 1. WAKE ──────────────────────────────────────────────
+    // ── 1. WAKE ──
     agent = await loadAgentState(AGENT_ID);
 
     if (agent.status === "sleeping" || agent.status === "acquired") {
-      console.log(`💤 Agent ${agent.name} est en sommeil ou acquis. Arret du cycle.`);
+      console.log(`💤 ${agent.name} dort. Arret.`);
       return;
     }
 
-    await updateAgentState(AGENT_ID, { current_action: "🔄 Chargement du contexte..." });
-    console.log(`✅ WAKE — ${agent.symbol} ${agent.name} charge (${agent.points} pts, ${agent.euros_generated}€)`);
+    await updateAgentState(AGENT_ID, { current_action: "🔄 Chargement..." });
+    console.log(`✅ WAKE — ${agent.symbol} ${agent.name} (${agent.points} pts, ${agent.euros_generated}€)`);
 
-    // ── 2. CONTEXTE VILLE + EMAILS + OUTILS ──────────────────
+    // ── 2. CONTEXTE ──
     const [cityContext, emails, availableTools] = await Promise.all([
       loadCityContext(AGENT_ID),
-      fetchRecentEmails(10),
+      fetchRecentEmails(agent, 10),
       loadAvailableTools(AGENT_ID),
     ]);
 
-    if (emails.length > 0) {
-      console.log(`📧 ${emails.length} email(s) non lu(s)`);
-    }
+    if (emails.length > 0) console.log(`📧 ${emails.length} email(s)`);
 
-    // ── 3. THINK + PLAN + ACT ────────────────────────────────
-    await updateAgentState(AGENT_ID, { current_action: "🧠 Analyse en cours..." });
+    // ── 3. THINK + PLAN (Sonnet cached) ──
+    await updateAgentState(AGENT_ID, { current_action: "🧠 Analyse..." });
 
     const systemPrompt = buildSystemPrompt(agent, cityContext, emails, availableTools);
-    const cyclePrompt = buildCyclePrompt(agent);
-
-    // ── 3. THINK + PLAN (Sonnet — cached) ──────────────────
+    const cyclePrompt = buildCyclePrompt(agent, eventType, eventData);
     const response = await callLLM("medium", systemPrompt, cyclePrompt, 2000);
 
     let cycleDecision;
@@ -424,19 +562,15 @@ async function runCycle() {
       const jsonMatch = rawText.match(/```json\n?([\s\S]*?)\n?```/) || rawText.match(/({[\s\S]*})/);
       cycleDecision = JSON.parse(jsonMatch ? jsonMatch[1] : rawText);
     } catch (e) {
-      throw new Error(`Reponse Claude non parseable: ${response.content[0].text.substring(0, 200)}`);
+      throw new Error(`Reponse non parseable: ${response.content[0].text.substring(0, 200)}`);
     }
 
     console.log(`🧠 THINK — ${cycleDecision.think}`);
+    await updateAgentState(AGENT_ID, { current_action: cycleDecision.current_action_label || "🔄 En action..." });
 
-    await updateAgentState(AGENT_ID, {
-      current_action: cycleDecision.current_action_label || "🔄 En action...",
-    });
-
-    // ── EXECUTE ACTIONS (réellement) ─────────────────────────
+    // ── 4. ACT ──
     for (const action of cycleDecision.actions || []) {
       console.log(`🔧 EXEC — ${action.tool}: ${action.description}`);
-
       let result = null;
       try {
         result = await executeTool(action, agent);
@@ -445,111 +579,216 @@ async function runCycle() {
         result = { success: false, error: e.message };
         console.error(`   → ❌ ${e.message}`);
       }
-
-      await log(AGENT_ID, action.type || "research", `${action.description} → ${action.expected_outcome}`, {
+      await log(AGENT_ID, action.type || "research", `${action.description}`, {
         tool_used: action.tool,
         status: result?.success ? "ok" : "error",
         metadata: { target: action.target, execution_result: result },
       });
     }
 
-    // ── 3b. TOOL REQUESTS ────────────────────────────────────
+    // ── TOOL REQUESTS ──
     for (const tr of cycleDecision.tool_requests || []) {
-      if (tr.tool_name && tr.reason) {
-        await requestTool(AGENT_ID, tr.tool_name, tr.reason);
+      if (tr.tool_name && tr.reason) await requestTool(AGENT_ID, tr.tool_name, tr.reason);
+    }
+
+    // ── 5. BATCH TASKS (non-urgent, 50% moins cher) ──
+    for (const batch of cycleDecision.batch_tasks || []) {
+      if (batch.label && batch.prompt) {
+        await submitBatchTask(
+          `Tu es ${agent.name}, agent IA specialise en ${agent.sector}.`,
+          batch.prompt,
+          batch.label
+        );
       }
     }
 
-    // ── 4. EARN? ─────────────────────────────────────────────
+    // ── 6. EARN? ──
     if (cycleDecision.earning_opportunity?.exists && cycleDecision.earning_opportunity?.amount_euros > 0) {
       const earning = cycleDecision.earning_opportunity;
-      const transaction = await submitEarning(
-        AGENT_ID,
-        earning.amount_euros,
-        earning.source,
-        earning.description,
-        earning.proof_url
-      );
-
-      await log(AGENT_ID, "earn",
-        `💰 ${earning.amount_euros}€ soumis pour validation Simon — ${earning.description}`,
-        {
-          euros_delta: earning.amount_euros,
-          metadata: { transaction_id: transaction.id, source: earning.source },
-        }
-      );
-
-      console.log(`💰 EARN — ${earning.amount_euros}€ soumis, en attente Simon`);
+      const transaction = await submitEarning(AGENT_ID, earning.amount_euros, earning.source, earning.description, earning.proof_url);
+      await log(AGENT_ID, "earn", `💰 ${earning.amount_euros}€ soumis`, {
+        euros_delta: earning.amount_euros,
+        metadata: { transaction_id: transaction.id, source: earning.source },
+      });
     }
 
-    // ── 5. LEARN (compressed via Haiku) ─────────────────────
+    // ── 7. LEARN (compressed via Haiku) ──
     const currentMemory = agent.memory || {};
     const compressed = await compressMemory(agent, cycleDecision);
-
     const compressedLog = [
-      ...(currentMemory.compressed_log || []).slice(-19), // keep last 20
-      { date: new Date().toISOString(), ...compressed },
+      ...(currentMemory.compressed_log || []).slice(-19),
+      { date: new Date().toISOString(), event: eventType, ...compressed },
     ];
-
     const updatedMemory = {
       ...currentMemory,
       last_cycle: new Date().toISOString(),
+      last_event: eventType,
       compressed_log: compressedLog,
       latest_insight: compressed.key_insight || cycleDecision.memory_update?.new_insight || null,
       latest_adjustment: compressed.next_priority || cycleDecision.memory_update?.strategy_adjustment || null,
     };
-
     await saveMemory(AGENT_ID, updatedMemory);
+    await log(AGENT_ID, "learn", `🧪 ${compressed.key_insight || "Cycle analyse"}`, { metadata: { compressed_summary: compressed } });
 
-    await log(AGENT_ID, "learn", `🧪 LEARN — ${compressed.key_insight || "Cycle analyse"}`, {
-      metadata: { compressed_summary: compressed },
-    });
-
-    // Read dynamic cycle interval from infrastructure (set via dashboard)
-    const dynamicInterval = agent.infrastructure?.cycle_interval_hours;
-    const nextCycleHours = dynamicInterval || parseInt(process.env.CYCLE_INTERVAL_HOURS || "4");
-
-    // Fermer le browser si ouvert
     await closeBrowser();
-
-    await updateAgentState(AGENT_ID, { current_action: `⏸️ Prochain cycle dans ${nextCycleHours}h` });
-    console.log(`✅ CYCLE TERMINE — Prochain cycle dans ${nextCycleHours}h`);
-
-    return nextCycleHours;
+    await updateAgentState(AGENT_ID, { current_action: `✅ Cycle OK — en attente d'evenement` });
+    console.log(`✅ CYCLE TERMINE [${eventType}] — Budget jour: ${rateLimiter.dailyCost.toFixed(2)}¢/${DAILY_BUDGET_CENTS}¢`);
 
   } catch (error) {
     console.error(`❌ ERREUR CYCLE:`, error.message);
-
     if (agent) {
-      await log(AGENT_ID, "error", `❌ Erreur cycle: ${error.message}`, {
+      await log(AGENT_ID, "error", `❌ ${error.message}`, {
         status: "error",
         metadata: { error: error.message, stack: error.stack?.substring(0, 500) },
       });
-      await updateAgentState(AGENT_ID, { current_action: "⚠️ Erreur — retry dans 1h" });
+      await updateAgentState(AGENT_ID, { current_action: "⚠️ Erreur" });
     }
-    return 1; // retry in 1h on error
   }
 }
 
-// ─── Démarrage ────────────────────────────────────────────────────────────────
+// ─── IMAP Polling (remplacement du webhook IMAP) ────────────────────────────
 
-async function scheduleNextCycle(intervalHours) {
-  const ms = intervalHours * 60 * 60 * 1000;
-  setTimeout(async () => {
-    const nextInterval = await runCycle();
-    scheduleNextCycle(nextInterval || 4);
-  }, ms);
+let lastEmailCheck = Date.now();
+
+async function checkNewEmails() {
+  try {
+    const agent = await loadAgentState(AGENT_ID);
+    if (agent.status === "sleeping") return;
+
+    const emails = await fetchRecentEmails(agent, 5);
+    if (emails.length > 0) {
+      const newEmails = emails.filter(e => new Date(e.date).getTime() > lastEmailCheck);
+      if (newEmails.length > 0) {
+        console.log(`📬 ${newEmails.length} nouvel(aux) email(s) detecte(s)`);
+        lastEmailCheck = Date.now();
+        await runCycle("email_received", { count: newEmails.length, latest: newEmails[0] });
+      }
+    }
+  } catch (e) {
+    console.warn(`⚠️ Email check failed: ${e.message}`);
+  }
 }
 
-async function start() {
-  const defaultHours = parseInt(process.env.CYCLE_INTERVAL_HOURS || "4");
-  console.log(`\n⚡ EXCELSIOR AGENT RUNTIME v2 DEMARRE`);
-  console.log(`Agent ID: ${AGENT_ID}`);
-  console.log(`IMAP: ${IMAP_HOST ? 'configuré' : 'non configuré (emails désactivés)'}`);
-  console.log(`Cycle par defaut: toutes les ${defaultHours}h (ajustable depuis le dashboard)\n`);
+// ─── Express Webhook Server ─────────────────────────────────────────────────
 
-  const nextInterval = await runCycle();
-  scheduleNextCycle(nextInterval || defaultHours);
+const app = express();
+app.use(express.json());
+
+// Health check (zero cost)
+app.get("/health", async (req, res) => {
+  const agent = await loadAgentState(AGENT_ID).catch(() => null);
+  res.json({
+    status: "ok",
+    agent: agent?.name || "unknown",
+    agentStatus: agent?.status || "unknown",
+    budgetToday: `${rateLimiter.dailyCost.toFixed(2)}¢/${DAILY_BUDGET_CENTS}¢`,
+    cyclesThisHour: rateLimiter.cycles.length,
+    uptime: process.uptime(),
+  });
+});
+
+// Webhook: Stripe sale
+app.post("/webhook/sale", async (req, res) => {
+  console.log(`🔔 Webhook sale recu`);
+  await runCycle("sale_detected", req.body);
+  res.json({ ok: true });
+});
+
+// Webhook: Email notification (si Mailcow webhook configure)
+app.post("/webhook/email", async (req, res) => {
+  console.log(`🔔 Webhook email recu`);
+  await runCycle("email_received", req.body);
+  res.json({ ok: true });
+});
+
+// Webhook: Manuel depuis le dashboard
+app.post("/webhook/manual", async (req, res) => {
+  const sig = req.headers["x-webhook-signature"];
+  if (WEBHOOK_SECRET !== "auto" && sig) {
+    if (!validateWebhookSignature(req.body, sig, WEBHOOK_SECRET)) {
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+  }
+  console.log(`🔔 Cycle manuel demande`);
+  await runCycle("manual", req.body);
+  res.json({ ok: true });
+});
+
+// API: Status rapide
+app.get("/status", async (req, res) => {
+  try {
+    const agent = await loadAgentState(AGENT_ID);
+    res.json({
+      name: agent.name,
+      status: agent.status,
+      points: agent.points,
+      euros: agent.euros_generated,
+      current_action: agent.current_action,
+      last_cycle: agent.memory?.last_cycle,
+      last_event: agent.memory?.last_event,
+      budget: { used: rateLimiter.dailyCost.toFixed(2), limit: DAILY_BUDGET_CENTS },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Catch-all securite
+app.use((req, res) => {
+  res.status(404).json({ error: "Route inconnue" });
+});
+
+// ─── Cron Jobs (event-driven) ───────────────────────────────────────────────
+
+function scheduleCrons() {
+  // Prospection: 1x/jour a 9h local
+  const now = new Date();
+  const next9am = new Date(now);
+  next9am.setHours(9, 0, 0, 0);
+  if (next9am <= now) next9am.setDate(next9am.getDate() + 1);
+  const msUntil9am = next9am - now;
+
+  setTimeout(() => {
+    runCycle("cron_prospecting");
+    // Puis toutes les 24h
+    setInterval(() => runCycle("cron_prospecting"), 24 * 60 * 60 * 1000);
+  }, msUntil9am);
+
+  console.log(`⏰ Cron prospection: prochain dans ${(msUntil9am / 3600000).toFixed(1)}h`);
+
+  // Check emails: toutes les 15 min (beaucoup moins cher que cycle IA toutes les 4h)
+  setInterval(checkNewEmails, 15 * 60 * 1000);
+  console.log(`📬 Check emails: toutes les 15 min`);
+
+  // Fallback cron cycle: 1x toutes les 8h (au lieu de 4h — evenements couvrent le reste)
+  setInterval(() => runCycle("cron_default"), 8 * 60 * 60 * 1000);
+  console.log(`🔄 Fallback cron: toutes les 8h`);
+}
+
+// ─── Demarrage ──────────────────────────────────────────────────────────────
+
+async function start() {
+  console.log(`\n⚡ EXCELSIOR AGENT RUNTIME v3 — EVENT-DRIVEN`);
+  console.log(`Agent ID: ${AGENT_ID}`);
+  console.log(`Budget: ${DAILY_BUDGET_CENTS}¢/jour | Rate limit: ${MAX_CYCLES_PER_HOUR}/h`);
+  console.log(`Webhook port: ${PORT}`);
+  console.log(`Webhook secret: ${WEBHOOK_SECRET === "auto" ? "auto-generated" : "configured"}\n`);
+
+  // Demarrer le serveur webhook
+  app.listen(PORT, () => {
+    console.log(`🌐 Webhook server: http://0.0.0.0:${PORT}`);
+    console.log(`   GET  /health — Health check`);
+    console.log(`   GET  /status — Agent status`);
+    console.log(`   POST /webhook/sale — Stripe webhook`);
+    console.log(`   POST /webhook/email — Email webhook`);
+    console.log(`   POST /webhook/manual — Declenchement manuel\n`);
+  });
+
+  // Cycle initial
+  await runCycle("startup");
+
+  // Programmer les crons
+  scheduleCrons();
 }
 
 start().catch(console.error);

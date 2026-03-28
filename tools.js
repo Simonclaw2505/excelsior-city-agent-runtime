@@ -1,11 +1,58 @@
 /**
- * EXCELSIOR CITY — Tool Execution Engine
- * Exécution réelle des outils des agents : browser, email, web_search, etc.
+ * EXCELSIOR CITY — Tool Execution Engine v2
+ * Execution reelle des outils + rate limiting par outil + securite renforcee
  */
 
 import puppeteer from "puppeteer";
 import nodemailer from "nodemailer";
 import { ImapFlow } from "imapflow";
+
+// ─── Tool Rate Limiting ─────────────────────────────────────────────────────
+
+const toolUsage = {};
+const TOOL_LIMITS = {
+  web_search: { max: 20, windowMs: 3600000 },    // 20/h
+  browser: { max: 15, windowMs: 3600000 },        // 15/h
+  email_outreach: { max: 5, windowMs: 3600000 },  // 5/h (anti-spam)
+  publish: { max: 3, windowMs: 3600000 },          // 3/h
+};
+
+function checkToolLimit(toolName) {
+  const limit = TOOL_LIMITS[toolName];
+  if (!limit) return true;
+
+  const now = Date.now();
+  if (!toolUsage[toolName]) toolUsage[toolName] = [];
+  toolUsage[toolName] = toolUsage[toolName].filter(t => now - t < limit.windowMs);
+
+  if (toolUsage[toolName].length >= limit.max) {
+    console.warn(`⚠️ TOOL RATE LIMIT: ${toolName} (${toolUsage[toolName].length}/${limit.max}/h)`);
+    return false;
+  }
+  toolUsage[toolName].push(now);
+  return true;
+}
+
+// ─── URL Validation ─────────────────────────────────────────────────────────
+
+const BLOCKED_DOMAINS = [
+  "localhost", "127.0.0.1", "0.0.0.0", "169.254.", "10.", "172.16.", "192.168.",
+  "metadata.google", "metadata.aws", "instance-data",
+];
+
+function isUrlSafe(url) {
+  if (!url || typeof url !== "string") return false;
+  try {
+    const parsed = new URL(url.startsWith("http") ? url : `https://${url}`);
+    for (const blocked of BLOCKED_DOMAINS) {
+      if (parsed.hostname.includes(blocked) || parsed.hostname.startsWith(blocked)) return false;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ─── BROWSER TOOL ────────────────────────────────────────────────────────────
 
@@ -32,9 +79,17 @@ async function getBrowser() {
  * Navigue vers une URL et retourne le contenu texte de la page
  */
 export async function browserNavigate(url) {
+  if (!isUrlSafe(url)) return { success: false, error: `URL bloquee: ${url}` };
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      // Block dangerous resource types
+      const blocked = ["media", "font"];
+      if (blocked.includes(req.resourceType())) req.abort();
+      else req.continue();
+    });
     await page.setUserAgent("Mozilla/5.0 (X11; Linux aarch64) ExcelsiorBot/1.0");
     await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
     const text = await page.evaluate(() => document.body.innerText.substring(0, 5000));
@@ -212,11 +267,19 @@ export async function executeTool(action, agent) {
   const mailbox = infra.mailbox || {};
   const email = infra.email;
 
+  // Rate limit check
+  if (!checkToolLimit(tool)) {
+    return { success: false, error: `Rate limit atteint pour ${tool}` };
+  }
+
   switch (tool) {
     case "web_search":
       return await webSearch(action.target || action.description);
 
     case "browser":
+      if (!isUrlSafe(action.target)) {
+        return { success: false, error: `URL bloquee (securite): ${action.target}` };
+      }
       return await browserNavigate(action.target || action.description);
 
     case "email_outreach":

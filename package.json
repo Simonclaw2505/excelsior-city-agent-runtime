@@ -1,7 +1,7 @@
 {
   "name": "excelsior-agent-runtime",
-  "version": "1.0.0",
-  "description": "Runtime agent Excelsior City — boucle WAKE→LOOP",
+  "version": "3.0.0",
+  "description": "Runtime agent Excelsior City — event-driven + batch API",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -14,7 +14,8 @@
     "dotenv": "^16.4.0",
     "imapflow": "^1.0.160",
     "puppeteer": "^22.0.0",
-    "nodemailer": "^6.9.0"
+    "nodemailer": "^6.9.0",
+    "express": "^4.18.0"
   },
   "engines": {
     "node": ">=18.0.0"
