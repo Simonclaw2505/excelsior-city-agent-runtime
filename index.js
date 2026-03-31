@@ -460,7 +460,7 @@ Reponds UNIQUEMENT avec ce JSON (pas de texte avant/apres) :
   "actions": [
     {
       "type": "research|write|outreach|publish|contract|collaborate|market",
-      "tool": "web_search|write|email_outreach|browser|api_externe|publish",
+      "tool": "web_search|write|email_outreach|browser|api_externe|publish|telegram",
       "description": "Description precise",
       "target": "URL, personne, plateforme",
       "expected_outcome": "Resultat attendu"

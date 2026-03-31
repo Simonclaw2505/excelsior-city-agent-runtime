@@ -14,7 +14,8 @@ const TOOL_LIMITS = {
   web_search: { max: 20, windowMs: 3600000 },    // 20/h
   browser: { max: 15, windowMs: 3600000 },        // 15/h
   email_outreach: { max: 5, windowMs: 3600000 },  // 5/h (anti-spam)
-  publish: { max: 3, windowMs: 3600000 },          // 3/h
+  telegram: { max: 10, windowMs: 3600000 },        // 10/h
+  publish: { max: 5, windowMs: 3600000 },          // 5/h
 };
 
 function checkToolLimit(toolName) {
@@ -255,6 +256,103 @@ export async function readEmails(imapConfig, maxCount = 10) {
   return emails;
 }
 
+// ─── TELEGRAM BOT TOOL ──────────────────────────────────────────────────────
+
+/**
+ * Envoie un message sur un canal/chat Telegram via Bot API
+ */
+export async function telegramSendMessage(botToken, chatId, text, parseMode = "HTML") {
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text.substring(0, 4096), // Telegram limit
+        parse_mode: parseMode,
+        disable_web_page_preview: false,
+      }),
+    });
+    const data = await response.json();
+    if (!data.ok) return { success: false, error: data.description || "Telegram API error" };
+    return { success: true, message_id: data.result.message_id, chat_id: chatId };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Cree ou met a jour la description/bio du canal Telegram
+ */
+export async function telegramSetDescription(botToken, chatId, description) {
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/setChatDescription`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, description: description.substring(0, 255) }),
+    });
+    const data = await response.json();
+    return { success: data.ok, error: data.ok ? null : data.description };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// ─── GUMROAD API TOOL ───────────────────────────────────────────────────────
+
+/**
+ * Cree un produit sur Gumroad via API
+ */
+export async function gumroadCreateProduct(apiKey, productData) {
+  try {
+    const params = new URLSearchParams({
+      access_token: apiKey,
+      name: productData.name || "Product",
+      price: String((productData.price_cents || 0)),
+      description: (productData.description || "").substring(0, 5000),
+      preview_url: productData.preview_url || "",
+    });
+
+    const response = await fetch("https://api.gumroad.com/v2/products", {
+      method: "POST",
+      body: params,
+    });
+    const data = await response.json();
+    if (!data.success) return { success: false, error: data.message || "Gumroad API error" };
+    return {
+      success: true,
+      product_id: data.product.id,
+      url: data.product.short_url,
+      name: data.product.name,
+      price: data.product.price,
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Liste les produits Gumroad existants
+ */
+export async function gumroadListProducts(apiKey) {
+  try {
+    const response = await fetch(`https://api.gumroad.com/v2/products?access_token=${apiKey}`);
+    const data = await response.json();
+    if (!data.success) return { success: false, error: data.message || "Gumroad API error" };
+    return {
+      success: true,
+      products: (data.products || []).map(p => ({
+        id: p.id, name: p.name, price: p.price,
+        url: p.short_url, sales_count: p.sales_count,
+      })),
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
 // ─── TOOL EXECUTOR ───────────────────────────────────────────────────────────
 
 /**
@@ -298,14 +396,39 @@ export async function executeTool(action, agent) {
       return { success: true, note: "Contenu genere par Claude dans le cycle" };
 
     case "publish":
-      // Publish nécessite les credentials de la plateforme (Gumroad etc.)
-      if (action.target?.includes("gumroad") && infra.gumroad?.api_key) {
-        return await browserNavigate(action.target);
+      // Publish via Gumroad API (create product) or Telegram (post message)
+      if (infra.gumroad?.api_key && (action.target?.includes("gumroad") || action.expected_outcome?.includes("gumroad"))) {
+        return await gumroadCreateProduct(infra.gumroad.api_key, {
+          name: action.target || action.description?.substring(0, 80),
+          price_cents: action.metadata?.price_cents || 900, // default 9€
+          description: action.description || "",
+        });
       }
-      return { success: false, error: "Plateforme de publication non configuree" };
+      if (infra.telegram?.bot_token && infra.telegram?.channel_id) {
+        return await telegramSendMessage(
+          infra.telegram.bot_token,
+          infra.telegram.channel_id,
+          action.description || action.target || ""
+        );
+      }
+      return { success: false, error: "Plateforme de publication non configuree (gumroad ou telegram requis)" };
+
+    case "telegram":
+      // Direct Telegram posting
+      if (!infra.telegram?.bot_token) {
+        return { success: false, error: "Telegram bot non configure" };
+      }
+      return await telegramSendMessage(
+        infra.telegram.bot_token,
+        infra.telegram.channel_id || action.target,
+        action.description || ""
+      );
 
     case "api_externe":
-      // API externe (Make.com etc.) — nécessite les credentials
+      // API externe (Make.com, Gumroad listing, etc.)
+      if (action.target?.includes("gumroad") && infra.gumroad?.api_key) {
+        return await gumroadListProducts(infra.gumroad.api_key);
+      }
       if (infra.make?.api_token) {
         return { success: true, note: "Make.com disponible", api_token: "configured" };
       }
